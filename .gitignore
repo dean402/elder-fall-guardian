@@ -1,0 +1,33 @@
+# Python / Raspberry Pi
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+pip-log.txt
+
+# Runtime data (generated on the Pi, never commit)
+status.json
+alarms.jsonl
+*.jsonl
+outputs/
+*.wav
+*.mp3
+*.jpg
+*.jpeg
+*.png
+camtest*.jpg
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.bak
+*.bak_*
+
+# Secrets / local env
+.env
+*.pem
+*.key
+id_ed25519*

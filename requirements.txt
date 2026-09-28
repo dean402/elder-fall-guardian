@@ -1,0 +1,12 @@
+# Pi runtime (install on Raspberry Pi 4B, Python 3.13):
+#   pip install -r requirements.txt
+#
+# fall_fusion.py + webapp/app.py use only the standard library.
+# Everything below is needed only by main_pi.py on real hardware.
+
+RPi.GPIO
+smbus2
+pyserial
+requests
+adafruit-blinka
+adafruit-circuitpython-dht
