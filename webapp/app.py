@@ -8,16 +8,16 @@
 
 部署步骤（树莓派 Pi 4B，系统 Python 3.13）：
   1) 复制本文件到派上：
-       scp webapp/app.py pi@<树莓派IP>:~/food_project/app.py
+       scp webapp/app.py admin@<派IP>:/home/admin/food_project/app.py
        （或 U 盘拷贝；本文件自身不含任何 IP/密码，访问一律用相对 URL）
   2) 新建 systemd 单元 /etc/systemd/system/webapp.service：
        [Unit]
        Description=老人监护移动端Web应用(:8080)
        After=network.target
        [Service]
-       User=pi
-       WorkingDirectory=/home/pi/food_project
-       ExecStart=/usr/bin/python3 /home/pi/food_project/app.py
+       User=admin
+       WorkingDirectory=/home/admin/food_project
+       ExecStart=/usr/bin/python3 /home/admin/food_project/app.py
        Restart=always
        [Install]
        WantedBy=multi-user.target
@@ -415,7 +415,7 @@ section.tab.active{display:block}
 <div class="card"><h2>心率血氧</h2><div class="row">
 <div class="kv"><div class="k">心率 BPM</div><div class="v" id="ovBpm">—</div></div>
 <div class="kv"><div class="k">血氧 SpO2 %</div><div class="v" id="ovSpo2">—</div></div>
-</div><div class="small">无指夹时为 0，属正常。</div></div>
+</div><div class="small">MAX30102 未佩戴（或读数野值）时显示“未佩戴”。</div></div>
 <div class="card" id="latestCard" style="display:none"><h2>最近抓拍</h2><img id="latestImg" class="latestImg" loading="lazy" alt="最近抓拍"><div class="small" id="latestTime"></div></div>
 </section>
 
@@ -426,10 +426,10 @@ section.tab.active{display:block}
 <div class="small">圆点带余晖拖尾为近 ~20 次位置；报警时红点定格。</div></div>
 <div class="card"><h2>雷达目标（LD2450）</h2>
 <div id="trackList" class="small">等待数据…</div>
-<div class="small">x/y 单位毫米，速度厘米/秒，距离米。</div></div>
-<div class="card"><h2>速度曲线（第一目标）</h2>
+<div class="small">坐标 x/y 单位毫米；径向速度=朝向/远离雷达分量（横走≈0），报警判定用位移速度（见速度曲线卡片）。</div></div>
+<div class="card"><h2>速度曲线（第一目标 · 位移速度）</h2>
 <canvas id="speedCv" width="600" height="150"></canvas>
-<div class="small">100 cm/s 红色虚线为跌倒阈值参考。</div></div>
+<div class="small">曲线=两帧坐标位移算出的真速度（横走也可见）；100 cm/s 红色虚线为静止分界参考，非报警线；报警 = 1m/s 活动后 3 秒内骤停 + 静止 3 秒。</div></div>
 </section>
 
 <section id="tab-alarms" class="tab">
@@ -451,10 +451,10 @@ section.tab.active{display:block}
 
 <section id="tab-about" class="tab">
 <div class="card"><h2>系统架构（四层）</h2><div class="arch">
-<div>感知层：LD2450 雷达 / MPU6050 / DHT11 / MAX30102 / 按键</div>
+<div>感知层：LD2450 轨迹雷达 / LD2410 存在雷达 / MPU6050 / DHT11 / MAX30102 / 按键</div>
 <div>网络层：同 WiFi 局域网直连，手机浏览器打开即可</div>
-<div>平台层：树莓派本机电荷融合判断与本地文件存储</div>
-<div>应用层：本页面（总览 / 轨迹 / 报警 / 设备 / 相册 / 关于）</div>
+<div>平台层：树莓派边缘判定（速度骤降沿检测：活动后 3 秒内静止沿 + 静止 3 秒，阈值 rules.json 可调）与本地文件存储</div>
+<div>应用层：本页面（总览 / 轨迹 / 报警 / 设备 / 相册 / 关于），判决不依赖存在检测</div>
 </div>
 <div class="small">离线优先：断网本地照常判断与报警，不依赖外网，不存密码。<br>演示四步：存在 / 跌倒模拟 / 按键求助 / 断网本地报警。</div></div>
 </section>
@@ -478,6 +478,8 @@ var currentBannerId = "";
 var audioCtx = null;
 var trails = [[], [], []];
 var alarmActive = false;
+var dispPrev = {ok:false, x:0, y:0, t:0};
+var dispEma = 0;
 document.querySelectorAll("#tabbar button").forEach(function(b){
   b.addEventListener("click", function(){
     activeTab = b.getAttribute("data-tab");
@@ -581,7 +583,7 @@ function drawCurve(){
   ctx.strokeStyle = "rgba(148,163,184,.25)"; ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(0,c.height); ctx.moveTo(0,c.height-1); ctx.lineTo(c.width,c.height-1); ctx.stroke();
   var maxV = 150, y = c.height - (100/maxV)*c.height;
   ctx.strokeStyle = "#f87171"; ctx.setLineDash([5,4]); ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(c.width,y); ctx.stroke(); ctx.setLineDash([]);
-  ctx.fillStyle = "#8fa1b8"; ctx.font = "12px sans-serif"; ctx.fillText("跌倒阈值100", 6, y-4);
+  ctx.fillStyle = "#8fa1b8"; ctx.font = "12px sans-serif"; ctx.fillText("静止分界100", 6, y-4);
   if(speedHist.length < 2) return;
   ctx.strokeStyle = "#22d3ee"; ctx.lineWidth = 2; ctx.beginPath();
   for(var i=0;i<speedHist.length;i++){
@@ -638,11 +640,26 @@ function renderStatus(s){
   document.getElementById("ovSpo2").textContent = (!_spo2 || _spo2 <= 0 || _spo2 < 70) ? "未佩戴" : s.spo2;
   var html = "";
   (s.radar_targets||[]).forEach(function(t,i){
-    html += "<div>目标"+(i+1)+"：x="+fmt(t.x,0)+"mm y="+fmt(t.y,0)+"mm 速度="+fmt(t.speed,1)+"cm/s 距离="+fmt(t.dist,2)+"m</div>";
+    html += "<div>目标"+(i+1)+"：x="+fmt(t.x,0)+"mm y="+fmt(t.y,0)+"mm 径向速度="+fmt(t.speed,1)+"cm/s 距离="+fmt(t.dist,2)+"m</div>";
   });
   document.getElementById("trackList").innerHTML = html || "当前无人 / 无有效目标";
-  var sp = ((s.radar_targets||[])[0]||{}).speed || 0;
-  speedHist.push(Number(sp)||0); if(speedHist.length>60) speedHist.shift(); drawCurve();
+  // 曲线喂位移速度（判定同源）：两帧坐标差/时间差，EMA 平滑；无坐标退回径向速度
+  var tgt0 = (s.radar_targets||[])[0] || {};
+  var dispSp = null, nowMs = Date.now();
+  if(tgt0.dist > 0 && tgt0.x !== undefined && !isNaN(Number(tgt0.x))){
+    if(dispPrev.ok){
+      var dts = (nowMs - dispPrev.t) / 1000;
+      if(dts > 0 && dts < 8){
+        var dmm = Math.hypot(Number(tgt0.x) - dispPrev.x, Number(tgt0.y) - dispPrev.y);
+        dispSp = Math.min(150, (dmm/10)/dts);
+      }
+    }
+    dispPrev = {ok:true, x:Number(tgt0.x), y:Number(tgt0.y), t:nowMs};
+  } else { dispPrev.ok = false; }
+  var sp;
+  if(dispSp !== null){ dispEma = 0.45*dispSp + 0.55*dispEma; sp = dispEma; }
+  else { dispEma = 0.65*dispEma; sp = Number(tgt0.speed)||0; }
+  speedHist.push(sp || 0); if(speedHist.length>60) speedHist.shift(); drawCurve();
   var tg = s.radar_targets || [];
   for(var ti=0; ti<3; ti++){
     if(!trails[ti]) trails[ti] = [];
@@ -782,7 +799,7 @@ async function tick(){
     }catch(e){}
   }
 }
-tick(); setInterval(tick, 2000);
+tick(); setInterval(tick, 600);
 </script>
 </body>
 </html>

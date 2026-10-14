@@ -62,7 +62,7 @@ def load_rules(path: str | None = None) -> dict:
 
     Args:
         path: JSON file path. Defaults to ``rules.json`` next to this file
-            (on the Pi that is ``~/food_project/rules.json``).
+            (on the Pi that is ``/home/admin/food_project/rules.json``).
 
     Returns:
         The parsed dict, or ``{}`` silently when the file is missing,
@@ -136,7 +136,7 @@ def pick_primary_target(targets) -> dict | None:
         try:
             if float(t.get("dist", 0)) > 0:
                 return t
-        except (Type/ValueError, AttributeError):
+        except (TypeError, ValueError, AttributeError):
             continue
     return None
 
@@ -183,19 +183,40 @@ class FallDetector:
         #   Longer than the 0.3 s step debounce because falls need only one.
         spike_cooldown: float = 1.0,
         # -- radar stillness side ----------------------------------------
-        # active_speed_threshold: |speed| at/above this = person moving.
-        #   Default 100.0 mirrors main_pi.py FALL_SPEED_THRESHOLD = 100.0,
-        #   reusing the codebase's existing notion of "significant motion".
-        active_speed_threshold: float = 100.0,
-        # still_speed_threshold: |speed| below this = (near-)motionless.
-        #   Well under the active line so walk-vs-lying separates cleanly.
-        still_speed_threshold: float = 50.0,
+        # active_speed_threshold: motion speed at/above this = person moving.
+        #   Motion speed prefers coordinate-displacement (sees lateral
+        #   walking; LD2450 'speed' field is radial-only and reads ~0 for
+        #   tangential movement). Default 30.0 cm/s implements the
+        #   ">0.3 m/s counts as motion" rule calibrated 2026-10-13 from a
+        #   90 s live trace: radial speed stayed <=8 cm/s while the target
+        #   demonstrably moved (dist 0.5-0.9 m, changing every phase).
+        active_speed_threshold: float = 30.0,
+        # still_speed_threshold: motion speed below this = (near-)motionless.
+        #   Same displacement metric; lying person's breathing residual
+        #   stays well under 30 cm/s after EMA smoothing (trace: noise),
+        #   while sitting jitter stays above 8 and under 30.
+        still_speed_threshold: float = 30.0,
         # stillness_duration (N seconds): still speed must persist this long
         #   AFTER a prior active period to count as confirmed stillness.
         #   This is the N-second confirmation window that rejects momentary
         #   pauses and radar dropouts.
         stillness_duration: float = 3.0,
         # -- fusion / alarm ----------------------------------------------
+        # alarm_mode: "fusion" (default; MPU impact spike + stillness) or
+        #   "transition" (radar-only speed-drop edge: motion >= still
+        #   threshold within ``transition_window`` seconds before confirmed
+        #   stillness = FALL, no MPU evidence needed). Rules key
+        #   ``alarm_mode`` overrides the constructor default.
+        alarm_mode: str = "fusion",
+        # transition_window: max seconds between the last motion frame and the
+        #   stillness EDGE (first still speed frame) in "transition" mode —
+        #   the "drop to <0.3 must happen within 3 s of moving" rule. Alarm
+        #   fires stillness_duration later; confirmed-then gap is not eaten by
+        #   EMA decay because the edge is measured at still-since, not now.
+        #   Default 3.0 mirrors the 2026-10-14 spec; longer windows catch slow
+        #   collapses but ordinary sitting-down maps to the same signature
+        #   (accepted tradeoff of radar-only).
+        transition_window: float = 3.0,
         # fusion_window (T seconds): confirmed stillness must complete within
         #   this long AFTER the spike to fuse into FALL (spike THEN stillness).
         #   A lone spike that never leads to stillness stays SUSPECT.
@@ -207,6 +228,13 @@ class FallDetector:
         # alarm_file: JSON-lines log path; each FALL appends one line
         #   {time, type, detail}. Caller may pass an alternate path in tests.
         alarm_file: str = DEFAULT_ALARM_FILE,
+        # pos_gate_mm (2026-10-14 identity fix): max mm between the tracked
+        #   target and the previous frame's position for the SAME physical
+        #   object. Beyond this, the candidate is a DIFFERENT reflection
+        #   (slot teleport) and the track is dropped -> ABSENT, never
+        #   counted as motion. Walking at 1.2 m/s spans ~160 mm per 0.1 s
+        #   frame; LD2450 slot swaps are >=300 mm, so 600 mm separates them.
+        pos_gate_mm: float = 600.0,
         # rules: platform-layer config dict as returned by load_rules()
         #   (rules.json next to this file). Applied only for keys present;
         #   an explicitly passed constructor arg always wins over rules;
@@ -217,18 +245,26 @@ class FallDetector:
         self.accel_baseline = float(accel_baseline)
         self.spike_threshold = _rule_or_explicit(rules, "spike_threshold", spike_threshold, 25000.0)
         self.spike_cooldown = float(spike_cooldown)
-        self.active_speed_threshold = _rule_or_explicit(rules, "active_speed_threshold", active_speed_threshold, 100.0)
-        self.still_speed_threshold = _rule_or_explicit(rules, "still_speed_threshold", still_speed_threshold, 50.0)
+        self.active_speed_threshold = _rule_or_explicit(rules, "active_speed_threshold", active_speed_threshold, 30.0)
+        self.still_speed_threshold = _rule_or_explicit(rules, "still_speed_threshold", still_speed_threshold, 30.0)
         self.stillness_duration = _rule_or_explicit(rules, "stillness_duration", stillness_duration, 3.0)
         self.fusion_window = _rule_or_explicit(rules, "fusion_window", fusion_window, 10.0)
         self.alarm_cooldown = _rule_or_explicit(rules, "alarm_cooldown", alarm_cooldown, 10.0)
+        self.transition_window = _rule_or_explicit(rules, "transition_window", transition_window, 2.0)
+        _mode = rules.get("alarm_mode")
+        self.alarm_mode = str(_mode) if _mode in ("fusion", "transition") else str(alarm_mode)
         self.alarm_file = alarm_file
+        self.pos_gate_mm = _rule_or_explicit(rules, "pos_gate_mm", pos_gate_mm, 600.0)
 
         self._last_spike_time: float | None = None   # last accepted spike
         self._last_alarm_time: float = 0.0           # epoch; 0 => first alarm free
         self._had_active: bool = False               # seen motion before stillness
         self._still_since: float | None = None       # start of current still run
         self._last_speed: float | None = None
+        # displacement-velocity state (sees lateral motion radial speed misses)
+        self._last_pos: tuple[float, float, float] | None = None  # (x, y, t)
+        self._disp_speed: float = 0.0                # EMA cm/s, displacement-based
+        self._last_active_time: float | None = None  # transition mode: last motion frame
 
     # -- introspection ----------------------------------------------------
     @property
@@ -251,6 +287,9 @@ class FallDetector:
         self._had_active = False
         self._still_since = None
         self._last_speed = None
+        self._last_pos = None
+        self._disp_speed = 0.0
+        self._last_active_time = None
 
     # -- per-sensor updates ------------------------------------------------
     def update_mpu(self, ax: float, ay: float, az: float, now: float | None = None) -> bool:
@@ -271,25 +310,102 @@ class FallDetector:
     def update_radar(self, targets, now: float | None = None) -> str:
         """Feed one radar frame. Returns ``"ACTIVE"`` / ``"STILL"`` / ``"ABSENT"``.
 
-        * ``ABSENT``: no valid target (all ``dist <= 0``) -- stillness run reset.
-        * ``ACTIVE``: ``|speed| >= still_speed_threshold`` -- marks ``_had_active``,
-          resets any still run (motion breaks stillness).
-        * ``STILL``: valid target with ``|speed| < still_speed_threshold`` --
+        Motion speed is displacement-based when coordinates are available:
+        LD2450's ``speed`` field is radial-only, so lateral walking reads ~0
+        and a radial-speed-only state machine never sees the target as
+        active (calibrated 2026-10-13 from a 90 s live trace). Coordinate
+        velocity is computed between consecutive frames and smoothed with
+        an EMA; the emitted motion speed is the max of displacement and
+        |radial| so approach/retreat瞬时 bursts still count.
+
+        * ``ABSENT``: no valid target (all ``dist <= 0``) -- stillness run reset
+          and displacement tracker dropped (position identity cannot be held
+          across a dropout).
+        * ``ACTIVE``: motion speed >= still_speed_threshold. Also marks
+          ``_had_active`` when >= active_speed_threshold, and resets any still
+          run (motion breaks stillness).
+        * ``STILL``: valid target with motion speed < still_speed_threshold --
           starts/continues the still run. Confirmation (elapsed >=
           ``stillness_duration`` with prior ``_had_active``) is checked in
           :meth:`stillness_confirmed`.
         """
         t = time.time() if now is None else float(now)
-        tgt = pick_primary_target(targets)
+        # --- identity-aware target pick (2026-10-14 fix) ---
+        # Naive "first valid target" tracking teleports between LD2450 slots
+        # whenever multiple reflectors swap order (chair/second person/ghost):
+        # a 1 m slot jump looks like 10 m/s phantom motion -> false alarms.
+        # Nearest-neighbor association instead: follow the target closest to
+        # the previously tracked position, but ONLY within ``pos_gate_mm``
+        # per frame; beyond the gate the identity is LOST -> ABSENT (never
+        # teleport). With no prior position, fall back to first valid.
+        valid: list = []
+        for t_item in targets:
+            try:
+                if float(t_item.get("dist", 0)) > 0:
+                    valid.append(t_item)
+            except (AttributeError, TypeError, ValueError):
+                continue
+        tgt: dict | None = None
+        if self._last_pos is not None:
+            best: dict | None = None
+            best_d: float | None = None
+            for cand in valid:
+                cand_x = cand.get("x")
+                cand_y = cand.get("y")
+                if not (isinstance(cand_x, (int, float)) and isinstance(cand_y, (int, float))):
+                    continue
+                d = math.hypot(float(cand_x) - self._last_pos[0], float(cand_y) - self._last_pos[1])
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = cand
+            if best is not None and best_d is not None and best_d <= self.pos_gate_mm:
+                tgt = best
+            # else: identity lost -> tgt stays None -> ABSENT below
+        else:
+            tgt = valid[0] if valid else None
         spd = target_speed(tgt)
         self._last_speed = spd
         if spd is None:
             self._still_since = None
+            self._last_pos = None
+            self._disp_speed = 0.0
             return "ABSENT"
-        if spd >= self.still_speed_threshold:
-            if spd >= self.active_speed_threshold:
+
+        motion_speed: float | None = None  # disp-only; radial kept informational
+        x = tgt.get("x")
+        y = tgt.get("y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            px, py, pt = self._last_pos if self._last_pos else (None, None, None)
+            dt = float(t) - float(pt) if pt is not None else 0.0
+            if dt > 0.0 and dt < 2.0:  # >2 s gap = identity broken, no teleport burst
+                d_mm = math.hypot(float(x) - float(px), float(y) - float(py))
+                inst_cm = min(300.0, (d_mm / 10.0) / dt)
+            elif dt >= 2.0 or (dt <= 0.0 and self._last_pos is not None):
+                inst_cm = 0.0
+            else:
+                inst_cm = 0.0
+            # EMA smoothing: slow attack (0.15) so an ISOLATED noise frame --
+            # radial speed pulse or a <=600 mm coordinate glitch from a
+            # reflector passing through the gate -- cannot reach the alarm
+            # threshold; sustained real walking (>=0.3 s of >=100 cm/s)
+            # arms within ~0.3 s of onset. Decay (0.85) clears stillness
+            # fast enough for the 3 s stillness window.
+            self._disp_speed = (0.15 * inst_cm + 0.85 * self._disp_speed)
+            self._last_pos = (float(x), float(y), t)
+            # Displacement is the ONLY motion evidence (radial is
+            # informational now): it sees lateral walks, and radial-field
+            # noise pulses on a stationary person can no longer fabricate
+            # motion frames.
+            motion_speed = self._disp_speed
+
+        if motion_speed is None:
+            self._still_since = None
+            return "ABSENT"
+        if motion_speed >= self.still_speed_threshold:
+            if motion_speed >= self.active_speed_threshold:
                 self._had_active = True
             self._still_since = None
+            self._last_active_time = t
             return "ACTIVE"
         if self._still_since is None:
             self._still_since = t
@@ -304,33 +420,66 @@ class FallDetector:
 
     # -- fusion -------------------------------------------------------------
     def check_fusion(self, now: float | None = None) -> dict | None:
-        """Evaluate the fusion rule; emit FALL (file + return) or SUSPECT (return).
+        """Evaluate the alarm rule; emit FALL (file + return) or SUSPECT (return).
 
-        * spike recorded AND stillness just confirmed within ``fusion_window``
-          after the spike -> FALL alarm (``_emit_fall``, cooldown-guarded).
-        * spike recorded but stillness not (yet/anymore) confirmed -> SUSPECT
-          observation dict (NOT written to the alarm file, NOT cooldown-bound).
-        * stillness confirmed with no recent spike -> SUSPECT dict likewise.
-        * neither -> None.
+        Two modes (``alarm_mode``, rules.json switchable):
 
-        After a FALL is emitted the fusion state resets (cooldown retained) so
-        one event yields one alarm.
+        * ``fusion`` (default): MPU spike recorded AND stillness confirmed
+          within ``fusion_window`` after the spike -> FALL. Spike alone or
+          stillness alone -> SUSPECT. Preserves the dual-signal evidence
+          chain (impact + then-motionless) against false positives.
+        * ``transition`` (2026-10-13/14 spec): radar-only speed-drop edge.
+          Speed > still threshold (motion) must drop below the still edge
+          ``transition_window`` seconds after the last motion frame; alarm
+          fires ``stillness_duration`` after that edge. ``transition_window``
+          shapes the tradeoff: strict keeps the "sudden" character of falls;
+          longer windows catch slow collapses but ordinary sitting-down maps
+          to the same signature, so the false-positive rate must be
+          re-measured (P2).
+        * neither -> None; SUSPECT is never written to the alarm file nor
+          cooldown-bound.
+
+        After a FALL is emitted the alarm state resets (cooldown retained)
+        so one event yields one alarm.
         """
         t = time.time() if now is None else float(now)
-        spike_ok = (
-            self._last_spike_time is not None
-            and 0.0 <= (t - self._last_spike_time) <= self.fusion_window
-        )
+        if self.alarm_mode == "transition":
+            # Edge semantics (2026-10-14 spec ">: >0.3 then <0.3 within 3 s"):
+            # the stillness EDGE must appear within ``transition_window``
+            # seconds AFTER the last motion frame; the alarm then fires when
+            # stillness completes (stillness_duration later). Measuring the
+            # edge via ``_still_since`` (first still frame) avoids the EMA
+            # decay lag eating windows.
+            edge_ok = (
+                self._last_active_time is not None
+                and self._still_since is not None
+                and 0.0 <= (self._still_since - self._last_active_time) <= self.transition_window
+            )
+            spike_ok = edge_ok
+        else:
+            spike_ok = (
+                self._last_spike_time is not None
+                and 0.0 <= (t - self._last_spike_time) <= self.fusion_window
+            )
         still_ok = self.stillness_confirmed(t)
         if spike_ok and still_ok:
-            event = self._emit_fall("spike-then-stillness fusion", now=t)
+            detail = (
+                "speed-drop to stillness (transition mode)"
+                if self.alarm_mode == "transition"
+                else "spike-then-stillness fusion"
+            )
+            event = self._emit_fall(detail, now=t)
             self.reset()
             return event  # None if suppressed by alarm cooldown
         if spike_ok:
             return {
                 "time": utc_now_iso(),
                 "type": "SUSPECT",
-                "detail": "MPU spike without confirmed stillness",
+                "detail": (
+                    "motion before stillness not yet confirmed (transition)"
+                    if self.alarm_mode == "transition"
+                    else "MPU spike without confirmed stillness"
+                ),
             }
         if still_ok:
             return {
@@ -463,9 +612,13 @@ def _rest_sample():
 
 
 def _walk_target(step: int) -> dict:
-    """Synthetic walking target: valid dist, clearly active speed."""
-    speeds = (120.0, 150.0, 90.0, 170.0, 110.0)
-    return {"dist": 1.5, "x": 100.0 + step, "y": 1500.0, "speed": speeds[step % len(speeds)]}
+    """Synthetic walking target: 0.6 m/s LATERAL walk.
+
+    x advances 60 mm per 0.1 s tick (= 60 cm/s displacement) while the
+    radial ``speed`` field reads LOW (as the real LD2450 does for
+    tangential movement). Tests the displacement-based motion metric.
+    """
+    return {"dist": 1.5, "x": 100.0 + step * 60.0, "y": 1500.0, "speed": 4.0}
 
 
 def _still_target() -> dict:
@@ -520,7 +673,7 @@ def _case_spike_then_stillness():
     for i in range(10):
         det.update(*_rest_sample(), [_walk_target(i)], now=t0 + i * 0.1)
     spike_t = t0 + 1.0
-    det.update(0, 0, 31000, [_walk_target(99)], now=spike_t)  # > 25000 spike
+    det.update(0, 0, 31000, [_walk_target(11)], now=spike_t)  # > 25000 spike
     # ... then near-zero speed held past stillness_duration (3 s default).
     alarm = None
     for k in range(40):  # 4 s @ 10 Hz
@@ -556,16 +709,111 @@ def _case_lone_spike():
     for i in range(10):
         det.update(*_rest_sample(), [_walk_target(i)], now=t0 + i * 0.1)
     spike_t = t0 + 1.0
-    first = det.update(0, 0, 31000, [_walk_target(99)], now=spike_t)
+    first = det.update(0, 0, 31000, [_walk_target(11)], now=spike_t)
     saw_fall = bool(first and first.get("type") == "FALL")
     # Keep walking: stillness never confirms, so no fusion.
     for k in range(40):
-        ev = det.update(*_rest_sample(), [_walk_target(k)], now=spike_t + 0.1 * (k + 1))
+        ev = det.update(*_rest_sample(), [_walk_target(12 + k)], now=spike_t + 0.1 * (k + 1))
         if ev is not None and ev.get("type") == "FALL":
             saw_fall = True
     logged = os.path.exists(path)
     ok = not saw_fall and not logged
     return ok, "lone spike stayed SUSPECT/None, no FALL, no file" if ok else "lone spike wrongly alarmed"
+
+
+def _case_lateral_walk_activates():
+    """Lateral walk with radial speed ~0 must still mark the target active.
+
+    Regression guard for the 2026-10-13 calibration: LD2450 'speed' is
+    radial-only, so displacement-based velocity must carry the ACTIVE
+    decision or slow walks never prime ``_had_active`` and falls cannot fuse.
+    """
+    det = FallDetector(alarm_file=os.devnull)
+    t0 = 1_700_000_000.0
+    states = []
+    for i in range(20):  # 2 s of 0.6 m/s lateral walking
+        states.append(det.update_radar([_walk_target(i)], now=t0 + i * 0.1))
+    ok = "ACTIVE" in states and det._had_active
+    return ok, "lateral walk marked ACTIVE and primed had_active" if ok else (
+        "states=%r had_active=%r" % (states[-3:], det._had_active))
+
+
+def _case_transition_drop_without_spike():
+    """Transition mode: speed drop 30->still 3s with NO MPU spike = FALL.
+
+    Regression for the 2026-10-13 requirement: alarm must not depend on
+    the accelerometer. Same datastream but rest-level accel throughout.
+    """
+    import tempfile
+
+    path = os.path.join(tempfile.gettempdir(), "fall_fusion_test_trans.jsonl")
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    det = FallDetector(alarm_file=path, alarm_mode="transition")
+    t0 = 1_700_000_000.0
+    for i in range(10):  # 1 s of lateral walking (radial ~0, displacement 60)
+        det.update(*_rest_sample(), [_walk_target(i)], now=t0 + i * 0.1)
+    alarm = None
+    for k in range(45):  # 4.5 s lying still, rest-level accel, no spike ever
+        alarm = det.update(*_rest_sample(), [_still_target()], now=t0 + 1.0 + 0.1 * (k + 1))
+        if alarm is not None and alarm.get("type") == "FALL":
+            break
+    ok = alarm is not None and alarm.get("type") == "FALL"
+    return ok, "transition mode raised FALL without any MPU spike" if ok else "expected FALL in transition mode, got none"
+
+
+def _case_transition_old_walk_far_no_fall():
+    """Transition mode: stale activity (person gone, returned, lies) -> no FALL.
+
+    Motion must be recent (<= transition_window) when stillness confirms.
+    Walk 1 s, walk OUT of radar view for 10 s (ABSENT), then lie still:
+    at stillness-confirm time the last ACTIVE frame is ~11 s stale, so no
+    FALL may fire (SUSPECT/None only).
+    """
+    import tempfile
+
+    det = FallDetector(alarm_file=os.devnull, alarm_mode="transition")
+    t0 = 1_700_000_000.0
+    for i in range(10):  # 1 s walking
+        det.update(*_rest_sample(), [_walk_target(i)], now=t0 + i * 0.1)
+    for k in range(100):  # 10 s with nobody in radar view (ABSENT)
+        det.update(*_rest_sample(), [], now=t0 + 1.0 + 0.1 * (k + 1))
+    saw_fall = False
+    for k in range(50):  # 5 s lying still after returning
+        ev = det.update(*_rest_sample(), [_still_target()], now=t0 + 11.0 + 0.1 * (k + 1))
+        if ev is not None and ev.get("type") == "FALL":
+            saw_fall = True
+    return (not saw_fall), "stale activity (gone 10s, lie still) stayed SUSPECT/None" if not saw_fall else "stale activity wrongly fused"
+
+
+def _case_teleport_decoy_no_fall():
+    """Identity fix: far decoy slot-swap must NOT fabricate motion.
+
+    Person tracked at A; a chair-like DECoy reflection appears closer to
+    the slot front every frame (1.2 m away from A, beyond 600 mm gate).
+    Old first-valid logic would teleport to the decoy -> giant phantom
+    speeds -> ACTIVE storm -> false FALL on the next stillness. New
+    nearest-neighbor with pos_gate ignores the decoy: stillness on the
+    real target keeps accumulating.
+    """
+    import tempfile
+
+    det = FallDetector(
+        alarm_file=os.devnull,
+        alarm_mode="transition",
+        rules={"active_speed_threshold": 100.0, "still_speed_threshold": 100.0, "pos_gate_mm": 600.0},
+    )
+    t0 = 1_700_000_000.0
+    near = {"dist": 0.8, "x": 100.0, "y": 1500.0, "speed": 0.0}
+    far_decoy = {"dist": 2.0, "x": 100.0, "y": 2700.0, "speed": 60.0}  # 1200 mm away, "moving"
+    states = []
+    for i in range(30):  # 3 s: tracked person STILL, decoy noisy
+        states.append(det.update_radar([far_decoy, near], now=t0 + i * 0.1))
+    ok = all(s == "STILL" for s in states) and not det._had_active
+    return ok, "slot teleport ignored, real target stillness preserved" if ok else (
+        "states=%r had_active=%r disp=%r" % (states[-3:], det._had_active, det._disp_speed))
 
 
 def _case_button():
@@ -601,6 +849,10 @@ def main() -> int:
         _run_case("normal walk -> no alarm", _case_normal_walk),
         _run_case("spike + stillness -> FALL alarm", _case_spike_then_stillness),
         _run_case("lone spike (motion continues) -> NO alarm", _case_lone_spike),
+        _run_case("lateral walk (radial~0) -> ACTIVE", _case_lateral_walk_activates),
+        _run_case("transition: drop 30->still3s, no spike -> FALL", _case_transition_drop_without_spike),
+        _run_case("transition: stale activity (gone 10s) -> no FALL", _case_transition_old_walk_far_no_fall),
+        _run_case("teleport decoy vs real target -> no phantom motion", _case_teleport_decoy_no_fall),
         _run_case("button GPIO17 -> immediate FALL event", _case_button),
         _run_case("10 s alarm cooldown suppresses repeat", _case_cooldown),
     ]
